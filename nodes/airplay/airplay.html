@@ -1,0 +1,144 @@
+<script type="text/javascript">
+    RED.nodes.registerType('airplay', {
+        category: 'airtunes',
+        color: '#a6bbcf',
+        defaults: {
+            name:       { value: '' },
+            device:     { value: '', type: 'airtunes-config', required: true },
+            mode:       { value: 'file' },
+            filePath:   { value: '' },
+            ttsText:    { value: '' },
+            ttsVoice:   { value: '' },
+            ttsTempDir: { value: '' }
+        },
+        inputs:       1,
+        outputs:      1,
+        icon:         'font-awesome/fa-music',
+        label: function () {
+            return this.name || 'airplay';
+        },
+        labelStyle: function () {
+            return this.name ? 'node_label_italic' : '';
+        },
+        paletteLabel: 'airplay',
+        oneditprepare: function () {
+            function updateVisibility() {
+                const isTts = $('#node-input-mode').val() === 'tts';
+                $('#row-filePath').toggle(!isTts);
+                $('#row-ttsText').toggle(isTts);
+                $('#row-ttsVoice').toggle(isTts);
+                $('#row-ttsTempDir').toggle(isTts);
+            }
+            $('#node-input-mode').on('change', updateVisibility);
+            updateVisibility();
+        }
+    });
+</script>
+
+<script type="text/html" data-template-name="airplay">
+    <div class="form-row">
+        <label for="node-input-name"><i class="fa fa-tag"></i> Name</label>
+        <input type="text" id="node-input-name" placeholder="airplay">
+    </div>
+    <div class="form-row">
+        <label for="node-input-device"><i class="fa fa-wifi"></i> Device</label>
+        <input type="text" id="node-input-device">
+    </div>
+    <div class="form-row">
+        <label for="node-input-mode"><i class="fa fa-sliders"></i> Mode</label>
+        <select id="node-input-mode" style="width:70%">
+            <option value="file">Play MP3 file</option>
+            <option value="tts">Text to Speech</option>
+        </select>
+    </div>
+
+    <!-- File mode -->
+    <div class="form-row" id="row-filePath">
+        <label for="node-input-filePath"><i class="fa fa-file-audio-o"></i> MP3 File Path</label>
+        <input type="text" id="node-input-filePath" placeholder="/home/pi/audio/beep.mp3">
+    </div>
+
+    <!-- TTS mode -->
+    <div class="form-row" id="row-ttsText">
+        <label for="node-input-ttsText"><i class="fa fa-comment"></i> Text to Speak</label>
+        <input type="text" id="node-input-ttsText" placeholder="Hello, this is a notification">
+    </div>
+    <div class="form-row" id="row-ttsVoice">
+        <label for="node-input-ttsVoice"><i class="fa fa-microphone"></i> Voice / Language</label>
+        <input type="text" id="node-input-ttsVoice"
+               placeholder="macOS: Anna, Petra, Markus  |  Linux: de, en, fr">
+        <div style="margin-top:4px;font-size:0.85em;color:#aaa">
+            macOS: voice name passed to <code>say -v</code>.
+            Linux: language code passed to <code>espeak -v</code>.
+            Leave blank to use the system default.
+        </div>
+    </div>
+    <div class="form-row" id="row-ttsTempDir">
+        <label for="node-input-ttsTempDir"><i class="fa fa-folder-open"></i> TTS Temp Dir</label>
+        <input type="text" id="node-input-ttsTempDir" placeholder="/tmp  (leave blank for OS default)">
+        <div style="margin-top:4px;font-size:0.85em;color:#aaa">
+            Directory for temporary TTS audio files. Leave blank to use the system temp folder.
+            Point to a RAM disk (e.g. <code>/Volumes/ramdisk</code>) to avoid SD card writes.
+        </div>
+    </div>
+</script>
+
+<script type="text/html" data-help-name="airplay">
+    <p>
+        Streams audio to an AirPlay device (e.g. HomePod) via <code>airtunes2</code> and
+        <code>ffmpeg</code>. Supports playing an MP3 file <em>or</em> speaking text using
+        the OS text-to-speech engine.
+    </p>
+
+    <h3>Inputs</h3>
+    <dl class="message-properties">
+        <dt class="optional">payload <span class="property-type">string</span></dt>
+        <dd>
+            In <b>TTS mode</b>: the text to speak.<br>
+            Set to <code>"stop"</code> in either mode to stop playback immediately.
+        </dd>
+        <dt class="optional">filePath <span class="property-type">string</span></dt>
+        <dd>Overrides the MP3 file path set on the node (file mode only).</dd>
+        <dt class="optional">text <span class="property-type">string</span></dt>
+        <dd>Text to speak — alternative to <code>msg.payload</code> (TTS mode only).</dd>
+        <dt class="optional">voice <span class="property-type">string</span></dt>
+        <dd>
+            Overrides the Voice / Language set on the node.<br>
+            macOS: voice name (e.g. <code>Anna</code>, <code>Markus</code>).
+            Linux: language code (e.g. <code>de</code>, <code>en</code>).
+        </dd>
+        <dt class="optional">volume <span class="property-type">number</span></dt>
+        <dd>Overrides the volume (0–100) from the config node.</dd>
+        <dt class="optional">mode <span class="property-type">string</span></dt>
+        <dd><code>"file"</code> or <code>"tts"</code> — overrides the node's mode.</dd>
+        <dt class="optional">stop <span class="property-type">boolean</span></dt>
+        <dd>Set to <code>true</code> to stop playback immediately.</dd>
+    </dl>
+
+    <h3>Output (sent when playback finishes)</h3>
+    <dl class="message-properties">
+        <dt>payload <span class="property-type">string</span></dt>
+        <dd><code>"ok"</code></dd>
+        <dt>status <span class="property-type">string</span></dt>
+        <dd><code>"done"</code></dd>
+        <dt>mode <span class="property-type">string</span></dt>
+        <dd><code>"file"</code> or <code>"tts"</code></dd>
+        <dt>source <span class="property-type">string</span></dt>
+        <dd>File path played (file mode) or text spoken (TTS mode).</dd>
+    </dl>
+
+    <h3>TTS requirements</h3>
+    <ul>
+        <li><b>macOS</b>: built-in <code>say</code> command — nothing to install.</li>
+        <li><b>Linux / Raspberry Pi</b>: <code>sudo apt install espeak</code></li>
+        <li><b>ffmpeg</b> required on both platforms.</li>
+    </ul>
+
+    <h3>Status indicators</h3>
+    <ul>
+        <li><b>Yellow / connecting…</b> – waiting for the AirPlay device.</li>
+        <li><b>Green / playing</b> – audio is streaming.</li>
+        <li><b>Grey / done</b> – playback finished normally.</li>
+        <li><b>Red</b> – error — check the debug panel.</li>
+    </ul>
+</script>
