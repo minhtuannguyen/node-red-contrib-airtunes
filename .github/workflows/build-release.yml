@@ -26,13 +26,12 @@ jobs:
         id: tarball
         run: echo "filename=$(ls -1 node-red-contrib-airtunes-*.tgz | head -1)" >> $GITHUB_OUTPUT
 
-      - name: Upload to release
+      - name: Upload tarball to release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v1
-        with:
-          files: ${{ steps.tarball.outputs.filename }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.release.tag_name }} ${{ steps.tarball.outputs.filename }}
 
       - name: Show tarball info
         run: |
