@@ -3,14 +3,15 @@
         category: 'airtunes',
         color: '#a6bbcf',
         defaults: {
-            name:       { value: '' },
-            device:     { value: '', type: 'airtunes-config', required: true },
-            mode:       { value: 'file' },
-            filePath:   { value: '' },
-            ttsText:    { value: '' },
-            ttsVoice:   { value: '' },
-            ttsTempDir: { value: '' },
-            cacheDir:   { value: '' }
+            name:          { value: '' },
+            device:        { value: '', type: 'airtunes-config', required: true },
+            mode:          { value: 'file' },
+            filePath:      { value: '' },
+            ttsText:       { value: '' },
+            ttsVoice:      { value: '' },
+            ttsTempDir:    { value: '' },
+            cacheDir:      { value: '' },
+            defaultVolume: { value: '', validate: RED.validators.number() }
         },
         inputs:       1,
         outputs:      1,
@@ -91,6 +92,16 @@
             Cache ffmpeg PCM output for instant replays. Significantly speeds up repeated file playback.
             Recommended: point to a RAM disk (e.g. <code>/Volumes/ramdisk</code> on Mac, <code>/mnt/ramdisk</code> on Pi)
             to avoid slow SD card writes. Cache is invalidated if source file changes.
+        </div>
+    </div>
+
+    <!-- Default Volume -->
+    <div class="form-row" id="row-defaultVolume">
+        <label for="node-input-defaultVolume"><i class="fa fa-volume-up"></i> Default Volume (0–100)</label>
+        <input type="number" id="node-input-defaultVolume" placeholder="(use device config)" min="0" max="100">
+        <div style="margin-top:4px;font-size:0.85em;color:#aaa">
+            Optional: set volume for this node. Leave blank to use the device's default volume.
+            Can be overridden per message with <code>msg.volume</code>.
         </div>
     </div>
 </script>

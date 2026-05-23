@@ -23,7 +23,8 @@ module.exports = function (RED) {
         node.ttsText    = config.ttsText    || '';
         node.ttsVoice   = config.ttsVoice   || '';
         node.ttsTempDir = config.ttsTempDir || '';
-        node.cacheDir   = config.cacheDir   || '';
+        node.cacheDir      = config.cacheDir      || '';
+        node.defaultVolume = config.defaultVolume !== undefined && config.defaultVolume !== '' ? parseInt(config.defaultVolume, 10) : null;
 
         let currentAirtunes = null;
         let currentFfmpeg   = null;
@@ -289,7 +290,7 @@ module.exports = function (RED) {
             }
 
             const mode     = msg.mode   || node.mode;
-            const volume   = msg.volume !== undefined ? (msg.volume | 0) : node.configNode.volume;
+            const volume   = msg.volume !== undefined ? (msg.volume | 0) : (node.defaultVolume !== null ? node.defaultVolume : node.configNode.volume);
             const voice    = msg.voice  || node.ttsVoice || '';
             const cacheDir = msg.cacheFolder !== undefined ? msg.cacheFolder : node.cacheDir;
 

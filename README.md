@@ -85,7 +85,7 @@ Stores connection details for one AirPlay device. Multiple **airplay** nodes can
 | **Name** | Friendly label | – |
 | **Host / IP** | IP address or hostname of the AirPlay device | – |
 | **Port** | AirPlay port | `7000` |
-| **Volume** | Playback volume (0–100) | `50` |
+| **Default Volume** | Playback volume for this device (0–100); used as fallback when airplay nodes don't set their own volume | `50` |
 
 ---
 
@@ -105,6 +105,7 @@ Streams audio to the configured AirPlay device on each incoming message.
 | **Voice / Language** | *(TTS mode)* Voice name on macOS (`say -v <name>`, e.g. `Anna`, `Markus`) or language code on Linux (`espeak -v <lang>`, e.g. `de`, `en`). Blank = system default |
 | **TTS Temp Dir** | *(TTS mode)* Directory for the temporary AIFF file created during TTS synthesis. Leave blank to use the system temp folder (`/tmp`). Point to a RAM disk to avoid disk writes |
 | **MP3 Cache Dir** | *(file mode, optional)* Directory for caching ffmpeg PCM output. Enables instant playback on file replays. Leave blank to disable. **Recommended:** point to a RAM disk for speed (e.g. `/Volumes/ramdisk` on Mac, `/mnt/ramdisk` on Pi) |
+| **Default Volume** | *(optional)* Playback volume for this node (0–100). Leave blank to use the device's default volume (from the config node). Can be overridden per message with `msg.volume` |
 
 #### Input message properties
 
@@ -114,7 +115,7 @@ Streams audio to the configured AirPlay device on each incoming message.
 | `msg.text` | `string` | TTS text (alternative to `msg.payload`) |
 | `msg.filePath` | `string` | Overrides the configured MP3 path (file mode) |
 | `msg.voice` | `string` | Overrides the configured voice / language (TTS mode) |
-| `msg.volume` | `number` | Overrides the volume (0–100) |
+| `msg.volume` | `number` | Playback volume (0–100). If set, overrides the node's default volume. If not set, uses the node's default (or the device's default if the node has no override) |
 | `msg.mode` | `string` | `"file"` or `"tts"` — overrides the node's mode |
 | `msg.cacheFolder` | `string` | Overrides the configured cache directory (file mode). Disables caching if set to empty string |
 | `msg.stop` | `boolean` | `true` to stop playback immediately |
