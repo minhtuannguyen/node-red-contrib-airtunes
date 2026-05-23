@@ -29,6 +29,49 @@ npm install node-red-contrib-airtunes
 
 Or install via **Manage Palette** in the Node-RED UI.
 
+### Raspberry Pi 3 / ARM (no compilation required)
+
+`airtunes2` ships a native C++ addon for ALAC encoding, but includes a complete **pure-JavaScript fallback** that activates automatically when the native binary is absent. All HomeKit pairing crypto (SRP, Curve25519, Ed25519, ChaCha20-Poly1305) is already pure JavaScript. No compilation needed.
+
+**Prerequisites on the Pi:**
+```bash
+sudo apt install ffmpeg        # required for audio decoding
+sudo apt install espeak        # only if using Text-to-Speech mode
+```
+
+**Install via tarball (recommended for Pi 3):**
+
+**Option A (automated): Use the build script**
+```bash
+cd /path/to/node-red-contrib-airtunes
+./build-tarball.sh
+# produces: node-red-contrib-airtunes-1.0.0.tgz (~4.5 MB)
+```
+
+**Option B (manual): Build step by step**
+
+1. On your Mac, clean build and create the tarball:
+   ```bash
+   cd /path/to/node-red-contrib-airtunes
+   rm -rf node_modules package-lock.json foo *.tgz
+   npm install --production --ignore-scripts --no-audit
+   npm pack
+   # produces: node-red-contrib-airtunes-1.0.0.tgz (~4.5 MB)
+   ```
+
+2. Copy the `.tgz` file to the Pi:
+   ```bash
+   scp node-red-contrib-airtunes-1.0.0.tgz pi@PI_IP:~/
+   ```
+
+3. On the Pi, install from the tarball:
+   ```bash
+   cd ~/.node-red
+   npm install ~/node-red-contrib-airtunes-1.0.0.tgz --ignore-scripts --no-audit
+   ```
+
+**Why this works:** The tarball is a complete binary archive with all dependencies pre-bundled, including airtunes2 and its slow GitHub-sourced packages (axlsign, chacha-js, mdns-js, dns-js). The Pi never downloads from GitHub. The `--production --ignore-scripts` flags ensure only runtime dependencies are included (no build tools, native compilation, or test files). Install takes a few minutes (SD card I/O) but always completes without memory errors or GitHub cloning delays.
+
 ---
 
 ## Nodes
@@ -61,6 +104,7 @@ Streams audio to the configured AirPlay device on each incoming message.
 | **Text to Speak** | *(TTS mode)* Default text; overridden at runtime by `msg.payload` or `msg.text` |
 | **Voice / Language** | *(TTS mode)* Voice name on macOS (`say -v <name>`, e.g. `Anna`, `Markus`) or language code on Linux (`espeak -v <lang>`, e.g. `de`, `en`). Blank = system default |
 | **TTS Temp Dir** | *(TTS mode)* Directory for the temporary AIFF file created during TTS synthesis. Leave blank to use the system temp folder (`/tmp`). Point to a RAM disk to avoid disk writes |
+| **MP3 Cache Dir** | *(file mode, optional)* Directory for caching ffmpeg PCM output. Enables instant playback on file replays. Leave blank to disable. **Recommended:** point to a RAM disk for speed (e.g. `/Volumes/ramdisk` on Mac, `/mnt/ramdisk` on Pi) |
 
 #### Input message properties
 
@@ -72,6 +116,7 @@ Streams audio to the configured AirPlay device on each incoming message.
 | `msg.voice` | `string` | Overrides the configured voice / language (TTS mode) |
 | `msg.volume` | `number` | Overrides the volume (0–100) |
 | `msg.mode` | `string` | `"file"` or `"tts"` — overrides the node's mode |
+| `msg.cacheFolder` | `string` | Overrides the configured cache directory (file mode). Disables caching if set to empty string |
 | `msg.stop` | `boolean` | `true` to stop playback immediately |
 
 #### Output message (emitted when playback finishes normally)
@@ -85,12 +130,33 @@ Streams audio to the configured AirPlay device on each incoming message.
 
 Use this output to chain actions after playback — for example, resuming Spotify via its Web API.
 
-#### Status indicators
+#### MP3 Caching for faster replays
+
+When a file is played for the first time, the plugin caches the ffmpeg PCM output (16-bit, 44.1 kHz, stereo). Subsequent plays of the same file skip ffmpeg entirely and read directly from the cache — **enabling instant playback**. The cache is automatically invalidated if the source file changes.
+
+**Setup:**
+1. Create a RAM disk (avoids slow SD card writes):
+   - **macOS**: `diskutil secureErase freespace 0 -type JHFS+ ramdisk 200m` → `/Volumes/ramdisk`
+   - **Linux / Pi**: `mkdir -p /mnt/ramdisk && mount -t tmpfs -o size=200m tmpfs /mnt/ramdisk`
+2. Configure the **MP3 Cache Dir** on the node to your RAM disk path
+3. Cache files are named by MD5 hash of the MP3 path (e.g. `3d5a5c8f...pcm`)
+
+**Result:** Playing the same MP3 every 5 minutes? First play takes 1–2 seconds (ffmpeg), subsequent plays are instant (<100ms).
+
+#### Status indicators on cache hits
+
+When a file is played from cache, the status shows the cached file size:
+- **Blue / playing (cached 2.1MB)** — reading from cache, not running ffmpeg
+
+---
+
+## Status indicators
 
 | Colour | Text | Meaning |
 |--------|------|---------|
 | Yellow | connecting… | Waiting for the AirPlay device |
 | Green | playing | Audio is streaming |
+| Blue | playing (cached …) | Reading from ffmpeg cache (file mode only) |
 | Grey | done | Finished normally |
 | Red | — | Error — check the debug panel |
 

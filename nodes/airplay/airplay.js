@@ -6,25 +6,39 @@ module.exports = function (RED) {
     const path      = require('path');
     const crypto    = require('crypto');
 
+    // Computed once at module load — avoids repeated syscalls on every message
+    const IS_DARWIN  = os.platform() === 'darwin';
+    const SYS_TMPDIR = os.tmpdir();
+
+    // Shared ffmpeg output args — one array instance reused across all spawns
+    const FFMPEG_OUT = ['-f', 's16le', '-ar', '44100', '-ac', '2', 'pipe:1'];
+
     function AirPlayNode(config) {
         RED.nodes.createNode(this, config);
         const node = this;
 
         node.configNode = RED.nodes.getNode(config.device);
-        node.filePath   = config.filePath  || '';
-        node.mode       = config.mode      || 'file'; // 'file' | 'tts'
-        node.ttsText    = config.ttsText   || '';
-        node.ttsVoice   = config.ttsVoice  || '';
-        node.ttsTempDir  = config.ttsTempDir  || '';
+        node.filePath   = config.filePath   || '';
+        node.mode       = config.mode       || 'file';
+        node.ttsText    = config.ttsText    || '';
+        node.ttsVoice   = config.ttsVoice   || '';
+        node.ttsTempDir = config.ttsTempDir || '';
+        node.cacheDir   = config.cacheDir   || '';
 
         let currentAirtunes = null;
         let currentFfmpeg   = null;
         let currentTtsProc  = null;
         let sessionId       = 0;
 
+        // Per-node caches — avoid repeated computation, cleared on node close
+        const cachePathMap  = new Map(); // "<cacheDir>\0<filePath>" → .pcm path
+        const confirmedDirs = new Set(); // cacheDir paths already verified to exist
+        let   tmpCounter    = 0;         // monotonic counter for temp file names (no crypto needed)
+
         // ── Cleanup ────────────────────────────────────────────────────────
 
         function stopPlayback() {
+            if (!currentAirtunes && !currentFfmpeg && !currentTtsProc) return;
             if (currentTtsProc) {
                 try { currentTtsProc.kill('SIGTERM'); } catch (_) {}
                 currentTtsProc = null;
@@ -41,30 +55,57 @@ module.exports = function (RED) {
         }
 
         // ── TTS command builder ────────────────────────────────────────────
-        // Returns { cmd, args, useTempFile } describing how to invoke TTS.
-        // macOS : say writes AIFF to a temp file (cannot stream to /dev/stdout)
-        // Linux : espeak streams WAV to stdout via --stdout
 
         function buildTtsCmd(voice) {
-            if (os.platform() === 'darwin') {
-                const args = [];
-                if (voice) args.push('-v', voice);
-                // caller appends: -o tempFile text
-                return {
-                    cmd: 'say', args,
-                    useTempFile: true,
-                    hint: '"say" is built-in on macOS'
-                };
+            if (IS_DARWIN) {
+                const args = voice ? ['-v', voice] : [];
+                return { cmd: 'say', args, useTempFile: true, hint: '"say" is built-in on macOS' };
             } else {
-                const args = ['--stdout'];
-                if (voice) args.push('-v', voice);
-                // caller appends: text
-                return {
-                    cmd: 'espeak', args,
-                    useTempFile: false,
-                    ffmpegInputFmt: [],
-                    hint: 'install with: sudo apt install espeak'
-                };
+                const args = voice ? ['--stdout', '-v', voice] : ['--stdout'];
+                return { cmd: 'espeak', args, useTempFile: false, ffmpegInputFmt: [], hint: 'sudo apt install espeak' };
+            }
+        }
+
+        // ── MP3 cache helpers ──────────────────────────────────────────────
+
+        function getCachePath(filePath, cacheDir) {
+            const key = cacheDir + '\0' + filePath;
+            let p = cachePathMap.get(key);
+            if (!p) {
+                // Hash by basename only — stable even if parent directory is renamed/moved
+                p = path.join(cacheDir, crypto.createHash('md5').update(path.basename(filePath)).digest('hex') + '.pcm');
+                cachePathMap.set(key, p);
+            }
+            return p;
+        }
+
+        function getCacheInfo(filePath, cacheDir) {
+            if (!cacheDir) return null;
+            try {
+                const cachePath = getCachePath(filePath, cacheDir);
+                const cs = fs.statSync(cachePath);
+                if (cs.size === 0) return null; // incomplete/failed cache file — ignore
+                // Cache has data — use it unless source still exists AND is newer
+                try {
+                    const ss = fs.statSync(filePath);
+                    if (ss.mtimeMs > cs.mtimeMs) return null; // source modified, re-encode
+                } catch (_) {
+                    // source file gone — use existing cache anyway
+                }
+                return { path: cachePath, size: cs.size };
+            } catch (_) {}
+            return null;
+        }
+
+        function ensureCacheDir(cacheDir) {
+            if (confirmedDirs.has(cacheDir)) return true;
+            try {
+                fs.mkdirSync(cacheDir, { recursive: true });
+                confirmedDirs.add(cacheDir);
+                return true;
+            } catch (err) {
+                node.warn('Cache dir not writable: ' + err.message);
+                return false;
             }
         }
 
@@ -74,9 +115,9 @@ module.exports = function (RED) {
             const airtunes = new AirTunes();
             currentAirtunes = airtunes;
 
-            // For macOS TTS: start 'say' NOW, in parallel with the AirPlay
-            // handshake, so the AIFF file is ready (or nearly ready) by the
-            // time the device reports 'ready' — reducing perceived start latency.
+            const effectiveCacheDir = options.cacheDir || node.cacheDir;
+
+            // macOS TTS: start 'say' immediately in parallel with AirPlay handshake
             let tts        = null;
             let tempFile   = null;
             let ttsReady   = false;
@@ -85,14 +126,14 @@ module.exports = function (RED) {
             if (options.type === 'tts') {
                 tts = buildTtsCmd(options.voice);
                 if (tts.useTempFile) {
-                    const tempDir = node.ttsTempDir || os.tmpdir();
-                    tempFile = path.join(tempDir, `tts-${crypto.randomBytes(6).toString('hex')}.aiff`);
-                    const ttsArgs = [...tts.args, '-o', tempFile, options.text];
-                    const ttsProc = spawn(tts.cmd, ttsArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
+                    const tempDir = node.ttsTempDir || SYS_TMPDIR;
+                    tempFile = path.join(tempDir, 'tts-' + process.pid + '-' + (++tmpCounter) + '.aiff');
+                    const ttsProc = spawn(tts.cmd, tts.args.concat(['-o', tempFile, options.text]),
+                        { stdio: ['ignore', 'ignore', 'pipe'] });
                     currentTtsProc = ttsProc;
-                    ttsProc.stderr.on('data', (d) => node.warn('TTS stderr: ' + d.toString().trim()));
+                    ttsProc.stderr.on('data', (d) => node.warn('TTS: ' + d.toString().trim()));
                     ttsProc.on('error', (err) => {
-                        node.error(`TTS error: ${err.message} — ${tts.hint}`);
+                        node.error('TTS error: ' + err.message + ' — ' + tts.hint);
                         node.status({ fill: 'red', shape: 'dot', text: 'TTS error' });
                         if (onDone) onDone(err);
                     });
@@ -104,10 +145,7 @@ module.exports = function (RED) {
                 }
             }
 
-            airtunes.add(node.configNode.host, {
-                port:   node.configNode.port,
-                volume: options.volume
-            });
+            airtunes.add(node.configNode.host, { port: node.configNode.port, volume: options.volume });
 
             airtunes.on('device', (deviceHost, deviceStatus) => {
                 if (currentAirtunes !== airtunes) return;
@@ -129,48 +167,74 @@ module.exports = function (RED) {
                     }
 
                     if (options.type === 'file') {
-                        const ffmpeg = spawn('ffmpeg', [
-                            '-i', options.filePath,
-                            '-f', 's16le', '-ar', '44100', '-ac', '2', 'pipe:1'
-                        ], { stdio: ['ignore', 'pipe', 'ignore'] });
-                        setupFfmpeg(ffmpeg);
+                        const cacheInfo = getCacheInfo(options.filePath, effectiveCacheDir);
+                        if (cacheInfo) {
+                            // Cache hit: skip ffmpeg, stream PCM directly
+                            node.status({ fill: 'blue', shape: 'dot', text: 'playing (cached)' });
+                            const rs = fs.createReadStream(cacheInfo.path, { highWaterMark: 256 * 1024 });
+                            rs.pipe(airtunes, { end: false });
+                            currentFfmpeg = { kill: () => rs.destroy() };
+                            rs.on('error', (err) => {
+                                node.error('Cache read error: ' + err.message);
+                                node.status({ fill: 'red', shape: 'dot', text: 'cache error' });
+                                if (onDone) onDone(err);
+                            });
+                            rs.on('close', () => {
+                                if (currentAirtunes === airtunes) airtunes.end();
+                            });
+                        } else {
+                            // Validate source file exists before spawning ffmpeg
+                            try { fs.statSync(options.filePath); } catch (_) {
+                                node.error('File not found: ' + options.filePath);
+                                node.status({ fill: 'red', shape: 'dot', text: 'file not found' });
+                                try { airtunes.stopAll(); } catch (_) {}
+                                currentAirtunes = null;
+                                if (onDone) onDone(new Error('file not found'));
+                                return;
+                            }
+                            // -nostdin: prevents ffmpeg polling stdin fd on Pi (saves CPU)
+                            const ffmpeg = spawn('ffmpeg',
+                                ['-nostdin', '-i', options.filePath].concat(FFMPEG_OUT),
+                                { stdio: ['ignore', 'pipe', 'ignore'] });
+                            if (effectiveCacheDir && ensureCacheDir(effectiveCacheDir)) {
+                                const cachePath = getCachePath(options.filePath, effectiveCacheDir);
+                                const ws = fs.createWriteStream(cachePath);
+                                ws.on('error', (err) => node.warn('Cache write error: ' + err.message));
+                                ffmpeg.stdout.pipe(ws);
+                                // Clean up incomplete (0-byte) cache file if ffmpeg fails
+                                ffmpeg.on('close', (code) => {
+                                    if (code !== 0) try { fs.unlinkSync(cachePath); } catch (_) {}
+                                });
+                            }
+                            setupFfmpeg(ffmpeg);
+                        }
 
                     } else if (tts.useTempFile) {
-                        // macOS: say already running; start ffmpeg when say finishes
                         function spawnFfmpegFromFile() {
                             if (currentAirtunes !== airtunes) {
                                 try { fs.unlinkSync(tempFile); } catch (_) {}
                                 return;
                             }
-                            const ffmpeg = spawn('ffmpeg', [
-                                '-i', tempFile,
-                                '-f', 's16le', '-ar', '44100', '-ac', '2', 'pipe:1'
-                            ], { stdio: ['ignore', 'pipe', 'ignore'] });
+                            const ffmpeg = spawn('ffmpeg',
+                                ['-nostdin', '-i', tempFile].concat(FFMPEG_OUT),
+                                { stdio: ['ignore', 'pipe', 'ignore'] });
                             setupFfmpeg(ffmpeg);
-                            ffmpeg.on('close', () => {
-                                try { fs.unlinkSync(tempFile); } catch (_) {}
-                            });
+                            ffmpeg.on('close', () => { try { fs.unlinkSync(tempFile); } catch (_) {} });
                         }
-                        if (ttsReady) {
-                            spawnFfmpegFromFile();
-                        } else {
-                            onTtsReady = spawnFfmpegFromFile;
-                        }
+                        if (ttsReady) spawnFfmpegFromFile();
+                        else onTtsReady = spawnFfmpegFromFile;
 
                     } else {
-                        // Linux: espeak streams WAV to stdout → ffmpeg stdin
-                        const ttsArgs = [...tts.args, options.text];
-                        const ttsProc = spawn(tts.cmd, ttsArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+                        const ttsProc = spawn(tts.cmd, tts.args.concat([options.text]),
+                            { stdio: ['ignore', 'pipe', 'pipe'] });
                         currentTtsProc = ttsProc;
-                        ttsProc.stderr.on('data', (d) => node.warn('TTS stderr: ' + d.toString().trim()));
-                        const ffmpeg = spawn('ffmpeg', [
-                            ...tts.ffmpegInputFmt,
-                            '-i', 'pipe:0',
-                            '-f', 's16le', '-ar', '44100', '-ac', '2', 'pipe:1'
-                        ], { stdio: ['pipe', 'pipe', 'ignore'] });
+                        ttsProc.stderr.on('data', (d) => node.warn('TTS: ' + d.toString().trim()));
+                        const ffmpeg = spawn('ffmpeg',
+                            ['-nostdin'].concat(tts.ffmpegInputFmt, ['-i', 'pipe:0'], FFMPEG_OUT),
+                            { stdio: ['pipe', 'pipe', 'ignore'] });
                         ttsProc.stdout.pipe(ffmpeg.stdin);
                         ttsProc.on('error', (err) => {
-                            node.error(`TTS error: ${err.message} — ${tts.hint}`);
+                            node.error('TTS error: ' + err.message + ' — ' + tts.hint);
                             node.status({ fill: 'red', shape: 'dot', text: 'TTS error' });
                             try { ffmpeg.stdin.end(); } catch (_) {}
                         });
@@ -224,36 +288,32 @@ module.exports = function (RED) {
                 return;
             }
 
-            const mode   = msg.mode   || node.mode;
-            const volume = (msg.volume !== undefined) ? parseInt(msg.volume) : node.configNode.volume;
-            const voice  = msg.voice  || node.ttsVoice || '';
+            const mode     = msg.mode   || node.mode;
+            const volume   = msg.volume !== undefined ? (msg.volume | 0) : node.configNode.volume;
+            const voice    = msg.voice  || node.ttsVoice || '';
+            const cacheDir = msg.cacheFolder !== undefined ? msg.cacheFolder : node.cacheDir;
 
             stopPlayback();
             const sid = ++sessionId;
 
             function onDone(err, meta) {
-                if (sessionId !== sid) return;
-                if (err) return;
+                if (sessionId !== sid || err) return;
                 node.send({
                     payload: 'ok',
                     status:  'done',
-                    mode:    mode,
-                    source:  mode === 'tts' ? (meta && meta.text) : (meta && meta.filePath)
+                    mode,
+                    source: mode === 'tts' ? (meta && meta.text) : (meta && meta.filePath)
                 });
             }
 
             if (mode === 'tts') {
-                const text = (typeof msg.payload === 'string' && msg.payload !== 'stop'
-                    ? msg.payload : null)
-                    || msg.text
-                    || node.ttsText;
-
+                const text = (typeof msg.payload === 'string' && msg.payload !== 'stop' ? msg.payload : null)
+                    || msg.text || node.ttsText;
                 if (!text) {
                     node.error('No text for TTS — set msg.payload, msg.text, or configure on the node');
                     node.status({ fill: 'red', shape: 'dot', text: 'no text' });
                     return;
                 }
-
                 node.status({ fill: 'yellow', shape: 'dot', text: 'connecting…' });
                 startPlayback({ type: 'tts', text, voice, volume, meta: { text } }, onDone);
 
@@ -265,12 +325,14 @@ module.exports = function (RED) {
                     return;
                 }
                 node.status({ fill: 'yellow', shape: 'dot', text: 'connecting…' });
-                startPlayback({ type: 'file', filePath, volume, meta: { filePath } }, onDone);
+                startPlayback({ type: 'file', filePath, volume, meta: { filePath }, cacheDir }, onDone);
             }
         });
 
         node.on('close', function (done) {
             stopPlayback();
+            cachePathMap.clear();
+            confirmedDirs.clear();
             done();
         });
     }

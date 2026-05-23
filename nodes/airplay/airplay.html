@@ -9,7 +9,8 @@
             filePath:   { value: '' },
             ttsText:    { value: '' },
             ttsVoice:   { value: '' },
-            ttsTempDir: { value: '' }
+            ttsTempDir: { value: '' },
+            cacheDir:   { value: '' }
         },
         inputs:       1,
         outputs:      1,
@@ -81,6 +82,17 @@
             Point to a RAM disk (e.g. <code>/Volumes/ramdisk</code>) to avoid SD card writes.
         </div>
     </div>
+
+    <!-- MP3 Cache -->
+    <div class="form-row" id="row-cacheDir">
+        <label for="node-input-cacheDir"><i class="fa fa-flash"></i> MP3 Cache Dir (Optional)</label>
+        <input type="text" id="node-input-cacheDir" placeholder="/tmp/airplay-cache  (leave blank to disable)">
+        <div style="margin-top:4px;font-size:0.85em;color:#aaa">
+            Cache ffmpeg PCM output for instant replays. Significantly speeds up repeated file playback.
+            Recommended: point to a RAM disk (e.g. <code>/Volumes/ramdisk</code> on Mac, <code>/mnt/ramdisk</code> on Pi)
+            to avoid slow SD card writes. Cache is invalidated if source file changes.
+        </div>
+    </div>
 </script>
 
 <script type="text/html" data-help-name="airplay">
@@ -111,6 +123,8 @@
         <dd>Overrides the volume (0–100) from the config node.</dd>
         <dt class="optional">mode <span class="property-type">string</span></dt>
         <dd><code>"file"</code> or <code>"tts"</code> — overrides the node's mode.</dd>
+        <dt class="optional">cacheFolder <span class="property-type">string</span></dt>
+        <dd>Overrides the MP3 Cache Dir for this playback (file mode only). Disables caching if empty.</dd>
         <dt class="optional">stop <span class="property-type">boolean</span></dt>
         <dd>Set to <code>true</code> to stop playback immediately.</dd>
     </dl>

@@ -23,5 +23,13 @@
   },
   "dependencies": {
     "airtunes2": "github:ciderapp/node_airtunes2"
-  }
+  },
+  "bundledDependencies": [
+    "airtunes2",
+    "axlsign",
+    "chacha-js",
+    "dns-js",
+    "mdns-js",
+    "prebuild-install"
+  ]
 }

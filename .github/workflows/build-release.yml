@@ -1,0 +1,40 @@
+name: Build and Release Tarball
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Make build script executable
+        run: chmod +x build-tarball.sh
+
+      - name: Build tarball
+        run: ./build-tarball.sh
+
+      - name: Get tarball filename
+        id: tarball
+        run: echo "filename=$(ls -1 node-red-contrib-airtunes-*.tgz | head -1)" >> $GITHUB_OUTPUT
+
+      - name: Upload to release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ${{ steps.tarball.outputs.filename }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show tarball info
+        run: |
+          ls -lh node-red-contrib-airtunes-*.tgz
+          echo "Tarball ready for download and deployment to Pi 3"
