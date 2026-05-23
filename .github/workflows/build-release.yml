@@ -26,12 +26,31 @@ jobs:
         id: tarball
         run: echo "filename=$(ls -1 node-red-contrib-airtunes-*.tgz | head -1)" >> $GITHUB_OUTPUT
 
-      - name: Upload tarball to release
-        if: github.event_name == 'release'
+      - name: Get version from package.json
+        id: version
+        run: |
+          VERSION=$(grep '"version"' package.json | head -1 | sed 's/.*"version": "\([^"]*\)".*/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Create release (if manual trigger)
+        if: github.event_name == 'workflow_dispatch'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload ${{ github.event.release.tag_name }} ${{ steps.tarball.outputs.filename }}
+          TAG="v${{ steps.version.outputs.version }}"
+          gh release create "$TAG" --generate-notes || true
+
+      - name: Upload tarball to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          if [ -z "$TAG" ]; then
+            TAG="v${{ steps.version.outputs.version }}"
+          fi
+          TARBALL="${{ steps.tarball.outputs.filename }}"
+          gh release upload "$TAG" "$TARBALL" || echo "Upload to $TAG completed"
 
       - name: Show tarball info
         run: |
