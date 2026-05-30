@@ -24,12 +24,14 @@ module.exports = function (RED) {
         node.ttsVoice   = config.ttsVoice   || '';
         node.ttsTempDir = config.ttsTempDir || '';
         node.cacheDir      = config.cacheDir      || '';
-        node.defaultVolume = config.defaultVolume !== undefined && config.defaultVolume !== '' ? parseInt(config.defaultVolume, 10) : null;
+        const dv = parseInt(config.defaultVolume, 10);
+        node.defaultVolume = isNaN(dv) ? null : dv;
 
-        let currentAirtunes = null;
-        let currentFfmpeg   = null;
-        let currentTtsProc  = null;
-        let sessionId       = 0;
+        let currentAirtunes  = null;
+        let currentFfmpeg    = null;
+        let currentTtsProc   = null;
+        let connectionTimer  = null;  // AirPlay connection watchdog
+        let sessionId        = 0;
 
         // Per-node caches — avoid repeated computation, cleared on node close
         const cachePathMap  = new Map(); // "<cacheDir>\0<filePath>" → .pcm path
@@ -39,6 +41,7 @@ module.exports = function (RED) {
         // ── Cleanup ────────────────────────────────────────────────────────
 
         function stopPlayback() {
+            if (connectionTimer) { clearTimeout(connectionTimer); connectionTimer = null; }
             if (!currentAirtunes && !currentFfmpeg && !currentTtsProc) return;
             if (currentTtsProc) {
                 try { currentTtsProc.kill('SIGTERM'); } catch (_) {}
@@ -116,7 +119,7 @@ module.exports = function (RED) {
             const airtunes = new AirTunes();
             currentAirtunes = airtunes;
 
-            const effectiveCacheDir = options.cacheDir || node.cacheDir;
+            const effectiveCacheDir = options.cacheDir;  // already resolved from input handler; empty string disables caching
 
             // macOS TTS: start 'say' immediately in parallel with AirPlay handshake
             let tts        = null;
@@ -134,6 +137,7 @@ module.exports = function (RED) {
                     currentTtsProc = ttsProc;
                     ttsProc.stderr.on('data', (d) => node.warn('TTS: ' + d.toString().trim()));
                     ttsProc.on('error', (err) => {
+                        onTtsReady = null; // prevent spawnFfmpegFromFile from running if AirPlay connects later
                         node.error('TTS error: ' + err.message + ' — ' + tts.hint);
                         node.status({ fill: 'red', shape: 'dot', text: 'TTS error' });
                         if (onDone) onDone(err);
@@ -141,15 +145,26 @@ module.exports = function (RED) {
                     ttsProc.on('close', () => {
                         if (currentTtsProc === ttsProc) currentTtsProc = null;
                         ttsReady = true;
-                        if (onTtsReady) onTtsReady();
+                        if (onTtsReady) { onTtsReady(); onTtsReady = null; }
                     });
                 }
             }
 
             airtunes.add(node.configNode.host, { port: node.configNode.port, volume: options.volume });
 
+            // Watchdog: if device never responds, release socket and resources
+            connectionTimer = setTimeout(() => {
+                if (currentAirtunes !== airtunes) return;
+                node.warn('AirPlay connection timeout — device unreachable');
+                node.status({ fill: 'red', shape: 'dot', text: 'timeout' });
+                try { airtunes.stopAll(); } catch (_) {}
+                currentAirtunes = null;
+                if (onDone) onDone(new Error('timeout'));
+            }, 10000);
+
             airtunes.on('device', (deviceHost, deviceStatus) => {
                 if (currentAirtunes !== airtunes) return;
+                clearTimeout(connectionTimer); connectionTimer = null;
 
                 if (deviceStatus === 'ready') {
                     node.status({ fill: 'green', shape: 'dot', text: 'playing' });
@@ -184,27 +199,25 @@ module.exports = function (RED) {
                                 if (currentAirtunes === airtunes) airtunes.end();
                             });
                         } else {
-                            // Validate source file exists before spawning ffmpeg
-                            try { fs.statSync(options.filePath); } catch (_) {
-                                node.error('File not found: ' + options.filePath);
-                                node.status({ fill: 'red', shape: 'dot', text: 'file not found' });
-                                try { airtunes.stopAll(); } catch (_) {}
-                                currentAirtunes = null;
-                                if (onDone) onDone(new Error('file not found'));
-                                return;
-                            }
+
                             // -nostdin: prevents ffmpeg polling stdin fd on Pi (saves CPU)
                             const ffmpeg = spawn('ffmpeg',
                                 ['-nostdin', '-i', options.filePath].concat(FFMPEG_OUT),
                                 { stdio: ['ignore', 'pipe', 'ignore'] });
                             if (effectiveCacheDir && ensureCacheDir(effectiveCacheDir)) {
-                                const cachePath = getCachePath(options.filePath, effectiveCacheDir);
-                                const ws = fs.createWriteStream(cachePath);
+                                // Write to a unique tmp file, rename to final on success.
+                                // Prevents a killed session from deleting a concurrent session's cache.
+                                const cacheFinal = getCachePath(options.filePath, effectiveCacheDir);
+                                const cacheTmp   = cacheFinal + '.' + (++tmpCounter) + '.tmp';
+                                const ws = fs.createWriteStream(cacheTmp);
                                 ws.on('error', (err) => node.warn('Cache write error: ' + err.message));
                                 ffmpeg.stdout.pipe(ws);
-                                // Clean up incomplete (0-byte) cache file if ffmpeg fails
                                 ffmpeg.on('close', (code) => {
-                                    if (code !== 0) try { fs.unlinkSync(cachePath); } catch (_) {}
+                                    if (code === 0) {
+                                        try { fs.renameSync(cacheTmp, cacheFinal); } catch (_) {}
+                                    } else {
+                                        try { fs.unlinkSync(cacheTmp); } catch (_) {}
+                                    }
                                 });
                             }
                             setupFfmpeg(ffmpeg);
@@ -254,8 +267,10 @@ module.exports = function (RED) {
                 }
             });
 
+            let endTimerSet = false;
             airtunes.on('buffer', (bufStatus) => {
-                if (bufStatus === 'end' && currentAirtunes === airtunes) {
+                if (bufStatus === 'end' && currentAirtunes === airtunes && !endTimerSet) {
+                    endTimerSet = true;
                     setTimeout(() => {
                         if (currentAirtunes !== airtunes) return;
                         try { airtunes.stopAll(); } catch (_) {}
@@ -269,8 +284,10 @@ module.exports = function (RED) {
             });
 
             airtunes.on('error', (err) => {
+                clearTimeout(connectionTimer); connectionTimer = null;
                 node.error('AirTunes error: ' + (err.message || err));
                 node.status({ fill: 'red', shape: 'dot', text: 'error' });
+                if (currentAirtunes === airtunes) currentAirtunes = null;
                 if (onDone) onDone(err);
             });
         }
@@ -323,6 +340,12 @@ module.exports = function (RED) {
                 if (!filePath) {
                     node.error('No file path — set msg.filePath or configure on the node');
                     node.status({ fill: 'red', shape: 'dot', text: 'no file path' });
+                    return;
+                }
+                // Validate early — before opening the AirPlay connection
+                try { fs.accessSync(filePath, fs.constants.R_OK); } catch (_) {
+                    node.error('File not found or not readable: ' + filePath);
+                    node.status({ fill: 'red', shape: 'dot', text: 'file not found' });
                     return;
                 }
                 node.status({ fill: 'yellow', shape: 'dot', text: 'connecting…' });
