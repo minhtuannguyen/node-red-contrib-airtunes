@@ -14,6 +14,28 @@ module.exports = function (RED) {
     const FFMPEG_OUT        = ['-f', 's16le', '-ar', '44100', '-ac', '2', 'pipe:1'];
     const ESPEAK_INPUT_FMT  = [];  // espeak outputs WAV directly to stdout — no extra ffmpeg input flags needed
     const R_OK              = fs.constants.R_OK;  // cached once — avoids property lookup on every input message
+    const PIPE_NO_END       = { end: false };     // reused across all .pipe() calls — avoids 2 object allocations per play
+    const PID               = process.pid;        // cached at module load — avoids property lookup in TTS hot path
+
+    // Pre-built TTS command descriptors — avoids object + array allocation per TTS play
+    const SAY_DEFAULT   = { cmd: 'say',    args: [],           useTempFile: true,  ffmpegInputFmt: null,            hint: '"say" is built-in on macOS' };
+    const ESPEAK_DEFAULT= { cmd: 'espeak', args: ['--stdout'], useTempFile: false, ffmpegInputFmt: ESPEAK_INPUT_FMT, hint: 'sudo apt install espeak' };
+
+    // Pre-built node.status payloads — avoids object allocation on every status update
+    const ST_CONNECTING = { fill: 'yellow', shape: 'dot', text: 'connecting…' };
+    const ST_PLAYING    = { fill: 'green',  shape: 'dot', text: 'playing' };
+    const ST_CACHED     = { fill: 'blue',   shape: 'dot', text: 'playing (cached)' };
+    const ST_DONE       = { fill: 'grey',   shape: 'dot', text: 'done' };
+    const ST_TIMEOUT    = { fill: 'red',    shape: 'dot', text: 'timeout' };
+    const ST_NO_CONFIG  = { fill: 'red',    shape: 'dot', text: 'no config' };
+    const ST_NO_TEXT    = { fill: 'red',    shape: 'dot', text: 'no text' };
+    const ST_NO_FILE    = { fill: 'red',    shape: 'dot', text: 'no file path' };
+    const ST_NOT_FOUND  = { fill: 'red',    shape: 'dot', text: 'file not found' };
+    const ST_TTS_ERR    = { fill: 'red',    shape: 'dot', text: 'TTS error' };
+    const ST_FFMPEG_ERR = { fill: 'red',    shape: 'dot', text: 'ffmpeg error' };
+    const ST_CACHE_ERR  = { fill: 'red',    shape: 'dot', text: 'cache error' };
+    const ST_AIRT_ERR   = { fill: 'red',    shape: 'dot', text: 'error' };
+    const ST_CLEAR      = {};
 
     function AirPlayNode(config) {
         RED.nodes.createNode(this, config);
@@ -73,18 +95,18 @@ module.exports = function (RED) {
                 try { currentAirtunes.removeAllListeners(); } catch (_) {}  // release closure refs held by event listeners
                 currentAirtunes = null;
             }
-            if (!silent) node.status({});
+            if (!silent) node.status(ST_CLEAR);
         }
 
         // ── TTS command builder ────────────────────────────────────────────
 
         function buildTtsCmd(voice) {
             if (IS_DARWIN) {
-                const args = voice ? ['-v', voice] : [];
-                return { cmd: 'say', args, useTempFile: true, hint: '"say" is built-in on macOS' };
+                if (!voice) return SAY_DEFAULT;
+                return { cmd: 'say', args: ['-v', voice], useTempFile: true, ffmpegInputFmt: null, hint: SAY_DEFAULT.hint };
             } else {
-                const args = voice ? ['--stdout', '-v', voice] : ['--stdout'];
-                return { cmd: 'espeak', args, useTempFile: false, ffmpegInputFmt: ESPEAK_INPUT_FMT, hint: 'sudo apt install espeak' };
+                if (!voice) return ESPEAK_DEFAULT;
+                return { cmd: 'espeak', args: ['--stdout', '-v', voice], useTempFile: false, ffmpegInputFmt: ESPEAK_INPUT_FMT, hint: ESPEAK_DEFAULT.hint };
             }
         }
 
@@ -151,7 +173,7 @@ module.exports = function (RED) {
                 tts = buildTtsCmd(options.voice);
                 if (tts.useTempFile) {
                     const tempDir = node.ttsTempDir || SYS_TMPDIR;
-                    tempFile = path.join(tempDir, 'tts-' + process.pid + '-' + (++tmpCounter) + '.aiff');
+                    tempFile = path.join(tempDir, 'tts-' + PID + '-' + (++tmpCounter) + '.aiff');
                     const ttsProc = spawn(tts.cmd, [...tts.args, '-o', tempFile, options.text],
                         { stdio: ['ignore', 'ignore', 'pipe'] });
                     currentTtsProc = ttsProc;
@@ -159,7 +181,7 @@ module.exports = function (RED) {
                     ttsProc.on('error', (err) => {
                         onTtsReady = null; // prevent spawnFfmpegFromFile from running if AirPlay connects later
                         node.error('TTS error: ' + err.message + ' — ' + tts.hint);
-                        node.status({ fill: 'red', shape: 'dot', text: 'TTS error' });
+                        node.status(ST_TTS_ERR);
                         if (onDone) onDone(err);
                     });
                     ttsProc.on('close', () => {
@@ -176,7 +198,7 @@ module.exports = function (RED) {
             connectionTimer = setTimeout(() => {
                 if (currentAirtunes !== airtunes) return;
                 node.warn('AirPlay connection timeout — device unreachable');
-                node.status({ fill: 'red', shape: 'dot', text: 'timeout' });
+                node.status(ST_TIMEOUT);
                 try { airtunes.stopAll(); } catch (_) {}
                 try { airtunes.removeAllListeners(); } catch (_) {}
                 currentAirtunes = null;
@@ -188,14 +210,14 @@ module.exports = function (RED) {
                 clearTimeout(connectionTimer); connectionTimer = null;
 
                 if (deviceStatus === 'ready') {
-                    node.status({ fill: 'green', shape: 'dot', text: 'playing' });
+                    node.status(ST_PLAYING);
 
                     function setupFfmpeg(ffmpeg) {
                         currentFfmpeg = ffmpeg;
-                        ffmpeg.stdout.pipe(airtunes, { end: false });
+                        ffmpeg.stdout.pipe(airtunes, PIPE_NO_END);
                         ffmpeg.on('error', (err) => {
                             node.error('ffmpeg error: ' + err.message);
-                            node.status({ fill: 'red', shape: 'dot', text: 'ffmpeg error' });
+                            node.status(ST_FFMPEG_ERR);
                             if (onDone) onDone(err);
                         });
                         ffmpeg.on('close', () => {
@@ -207,13 +229,13 @@ module.exports = function (RED) {
                         const cachePath = getCacheInfo(options.filePath, effectiveCacheDir);
                         if (cachePath) {
                             // Cache hit: skip ffmpeg, stream PCM directly
-                            node.status({ fill: 'blue', shape: 'dot', text: 'playing (cached)' });
+                            node.status(ST_CACHED);
                             const rs = fs.createReadStream(cachePath, { highWaterMark: 256 * 1024 });
-                            rs.pipe(airtunes, { end: false });
+                            rs.pipe(airtunes, PIPE_NO_END);
                             currentFfmpeg = { kill: () => rs.destroy() };
                             rs.on('error', (err) => {
                                 node.error('Cache read error: ' + err.message);
-                                node.status({ fill: 'red', shape: 'dot', text: 'cache error' });
+                                node.status(ST_CACHE_ERR);
                                 if (onDone) onDone(err);
                             });
                             rs.on('close', () => {
@@ -229,7 +251,7 @@ module.exports = function (RED) {
                                 // Prevents a killed session from deleting a concurrent session's cache.
                                 const cacheFinal = getCachePath(options.filePath, effectiveCacheDir);
                                 const cacheTmp   = cacheFinal + '.' + (++tmpCounter) + '.tmp';
-                                const ws = fs.createWriteStream(cacheTmp);
+                                const ws = fs.createWriteStream(cacheTmp, { highWaterMark: 256 * 1024 });
                                 ws.on('error', (err) => node.warn('Cache write error: ' + err.message));
                                 ffmpeg.stdout.pipe(ws);
                                 ffmpeg.on('close', (code) => {
@@ -269,7 +291,7 @@ module.exports = function (RED) {
                         ttsProc.stdout.pipe(ffmpeg.stdin);
                         ttsProc.on('error', (err) => {
                             node.error('TTS error: ' + err.message + ' — ' + tts.hint);
-                            node.status({ fill: 'red', shape: 'dot', text: 'TTS error' });
+                            node.status(ST_TTS_ERR);
                             try { ffmpeg.stdin.end(); } catch (_) {}
                         });
                         ttsProc.on('close', () => {
@@ -281,7 +303,7 @@ module.exports = function (RED) {
 
                 } else if (deviceStatus === 'error' || deviceStatus === 'failed') {
                     node.error('Device ' + deviceHost + ' reported: ' + deviceStatus);
-                    node.status({ fill: 'red', shape: 'dot', text: deviceStatus });
+                    node.status(ST_AIRT_ERR);
                     try { airtunes.stopAll(); } catch (_) {}
                     try { airtunes.removeAllListeners(); } catch (_) {}
                     currentAirtunes = null;
@@ -300,7 +322,7 @@ module.exports = function (RED) {
                         currentAirtunes = null;
                         currentFfmpeg   = null;
                         currentTtsProc  = null;
-                        node.status({ fill: 'grey', shape: 'dot', text: 'done' });
+                        node.status(ST_DONE);
                         if (onDone) onDone(null, isTts ? options.text : options.filePath);
                     }, 3000);
                 }
@@ -309,7 +331,7 @@ module.exports = function (RED) {
             airtunes.on('error', (err) => {
                 clearTimeout(connectionTimer); connectionTimer = null;
                 node.error('AirTunes error: ' + (err.message || err));
-                node.status({ fill: 'red', shape: 'dot', text: 'error' });
+                node.status(ST_AIRT_ERR);
                 if (currentAirtunes === airtunes) {
                     try { airtunes.removeAllListeners(); } catch (_) {}
                     currentAirtunes = null;
@@ -328,7 +350,7 @@ module.exports = function (RED) {
 
             if (!node.configNode) {
                 node.error('No AirTunes config node selected');
-                node.status({ fill: 'red', shape: 'dot', text: 'no config' });
+                node.status(ST_NO_CONFIG);
                 return;
             }
 
@@ -350,26 +372,26 @@ module.exports = function (RED) {
                     || msg.text || node.ttsText;
                 if (!text) {
                     node.error('No text for TTS — set msg.payload, msg.text, or configure on the node');
-                    node.status({ fill: 'red', shape: 'dot', text: 'no text' });
+                    node.status(ST_NO_TEXT);
                     return;
                 }
-                node.status({ fill: 'yellow', shape: 'dot', text: 'connecting…' });
+                node.status(ST_CONNECTING);
                 startPlayback({ type: 'tts', text, voice, volume }, onDone);
 
             } else {
                 const filePath = msg.filePath || node.filePath;
                 if (!filePath) {
                     node.error('No file path — set msg.filePath or configure on the node');
-                    node.status({ fill: 'red', shape: 'dot', text: 'no file path' });
+                    node.status(ST_NO_FILE);
                     return;
                 }
                 // Validate early — before opening the AirPlay connection
                 try { fs.accessSync(filePath, R_OK); } catch (_) {
                     node.error('File not found or not readable: ' + filePath);
-                    node.status({ fill: 'red', shape: 'dot', text: 'file not found' });
+                    node.status(ST_NOT_FOUND);
                     return;
                 }
-                node.status({ fill: 'yellow', shape: 'dot', text: 'connecting…' });
+                node.status(ST_CONNECTING);
                 startPlayback({ type: 'file', filePath, volume, cacheDir }, onDone);
             }
         });
