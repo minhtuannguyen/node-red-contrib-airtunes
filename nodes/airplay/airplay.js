@@ -11,7 +11,9 @@ module.exports = function (RED) {
     const SYS_TMPDIR = os.tmpdir();
 
     // Shared ffmpeg output args — one array instance reused across all spawns
-    const FFMPEG_OUT = ['-f', 's16le', '-ar', '44100', '-ac', '2', 'pipe:1'];
+    const FFMPEG_OUT        = ['-f', 's16le', '-ar', '44100', '-ac', '2', 'pipe:1'];
+    const ESPEAK_INPUT_FMT  = [];  // espeak outputs WAV directly to stdout — no extra ffmpeg input flags needed
+    const R_OK              = fs.constants.R_OK;  // cached once — avoids property lookup on every input message
 
     function AirPlayNode(config) {
         RED.nodes.createNode(this, config);
@@ -27,6 +29,11 @@ module.exports = function (RED) {
         const dv = parseInt(config.defaultVolume, 10);
         node.defaultVolume = isNaN(dv) ? null : dv;
 
+        // Cache config-node values — avoids repeated property chain lookups per message
+        const devHost   = node.configNode ? node.configNode.host   : '';
+        const devPort   = node.configNode ? node.configNode.port   : 7000;
+        const devVolume = node.configNode ? node.configNode.volume : 50;
+
         let currentAirtunes  = null;
         let currentFfmpeg    = null;
         let currentTtsProc   = null;
@@ -38,9 +45,19 @@ module.exports = function (RED) {
         const confirmedDirs = new Set(); // cacheDir paths already verified to exist
         let   tmpCounter    = 0;         // monotonic counter for temp file names (no crypto needed)
 
+        // Evict oldest entries when Map grows too large (long-running Pi with many files)
+        function trimCachePathMap() {
+            if (cachePathMap.size <= 500) return;
+            let n = 100;
+            for (const k of cachePathMap.keys()) {
+                cachePathMap.delete(k);
+                if (--n === 0) break;
+            }
+        }
+
         // ── Cleanup ────────────────────────────────────────────────────────
 
-        function stopPlayback() {
+        function stopPlayback(silent) {
             if (connectionTimer) { clearTimeout(connectionTimer); connectionTimer = null; }
             if (!currentAirtunes && !currentFfmpeg && !currentTtsProc) return;
             if (currentTtsProc) {
@@ -53,9 +70,10 @@ module.exports = function (RED) {
             }
             if (currentAirtunes) {
                 try { currentAirtunes.stopAll(); } catch (_) {}
+                try { currentAirtunes.removeAllListeners(); } catch (_) {}  // release closure refs held by event listeners
                 currentAirtunes = null;
             }
-            node.status({});
+            if (!silent) node.status({});
         }
 
         // ── TTS command builder ────────────────────────────────────────────
@@ -66,7 +84,7 @@ module.exports = function (RED) {
                 return { cmd: 'say', args, useTempFile: true, hint: '"say" is built-in on macOS' };
             } else {
                 const args = voice ? ['--stdout', '-v', voice] : ['--stdout'];
-                return { cmd: 'espeak', args, useTempFile: false, ffmpegInputFmt: [], hint: 'sudo apt install espeak' };
+                return { cmd: 'espeak', args, useTempFile: false, ffmpegInputFmt: ESPEAK_INPUT_FMT, hint: 'sudo apt install espeak' };
             }
         }
 
@@ -79,6 +97,7 @@ module.exports = function (RED) {
                 // Hash by basename only — stable even if parent directory is renamed/moved
                 p = path.join(cacheDir, crypto.createHash('md5').update(path.basename(filePath)).digest('hex') + '.pcm');
                 cachePathMap.set(key, p);
+                trimCachePathMap();
             }
             return p;
         }
@@ -96,7 +115,7 @@ module.exports = function (RED) {
                 } catch (_) {
                     // source file gone — use existing cache anyway
                 }
-                return { path: cachePath, size: cs.size };
+                return cachePath;
             } catch (_) {}
             return null;
         }
@@ -118,6 +137,7 @@ module.exports = function (RED) {
         function startPlayback(options, onDone) {
             const airtunes = new AirTunes();
             currentAirtunes = airtunes;
+            const isTts = options.type === 'tts';  // hoist: avoids repeated string comparison
 
             const effectiveCacheDir = options.cacheDir;  // already resolved from input handler; empty string disables caching
 
@@ -127,12 +147,12 @@ module.exports = function (RED) {
             let ttsReady   = false;
             let onTtsReady = null;
 
-            if (options.type === 'tts') {
+            if (isTts) {
                 tts = buildTtsCmd(options.voice);
                 if (tts.useTempFile) {
                     const tempDir = node.ttsTempDir || SYS_TMPDIR;
                     tempFile = path.join(tempDir, 'tts-' + process.pid + '-' + (++tmpCounter) + '.aiff');
-                    const ttsProc = spawn(tts.cmd, tts.args.concat(['-o', tempFile, options.text]),
+                    const ttsProc = spawn(tts.cmd, [...tts.args, '-o', tempFile, options.text],
                         { stdio: ['ignore', 'ignore', 'pipe'] });
                     currentTtsProc = ttsProc;
                     ttsProc.stderr.on('data', (d) => node.warn('TTS: ' + d.toString().trim()));
@@ -150,7 +170,7 @@ module.exports = function (RED) {
                 }
             }
 
-            airtunes.add(node.configNode.host, { port: node.configNode.port, volume: options.volume });
+            airtunes.add(devHost, { port: devPort, volume: options.volume });
 
             // Watchdog: if device never responds, release socket and resources
             connectionTimer = setTimeout(() => {
@@ -158,6 +178,7 @@ module.exports = function (RED) {
                 node.warn('AirPlay connection timeout — device unreachable');
                 node.status({ fill: 'red', shape: 'dot', text: 'timeout' });
                 try { airtunes.stopAll(); } catch (_) {}
+                try { airtunes.removeAllListeners(); } catch (_) {}
                 currentAirtunes = null;
                 if (onDone) onDone(new Error('timeout'));
             }, 10000);
@@ -182,12 +203,12 @@ module.exports = function (RED) {
                         });
                     }
 
-                    if (options.type === 'file') {
-                        const cacheInfo = getCacheInfo(options.filePath, effectiveCacheDir);
-                        if (cacheInfo) {
+                    if (!isTts) {
+                        const cachePath = getCacheInfo(options.filePath, effectiveCacheDir);
+                        if (cachePath) {
                             // Cache hit: skip ffmpeg, stream PCM directly
                             node.status({ fill: 'blue', shape: 'dot', text: 'playing (cached)' });
-                            const rs = fs.createReadStream(cacheInfo.path, { highWaterMark: 256 * 1024 });
+                            const rs = fs.createReadStream(cachePath, { highWaterMark: 256 * 1024 });
                             rs.pipe(airtunes, { end: false });
                             currentFfmpeg = { kill: () => rs.destroy() };
                             rs.on('error', (err) => {
@@ -199,10 +220,9 @@ module.exports = function (RED) {
                                 if (currentAirtunes === airtunes) airtunes.end();
                             });
                         } else {
-
                             // -nostdin: prevents ffmpeg polling stdin fd on Pi (saves CPU)
                             const ffmpeg = spawn('ffmpeg',
-                                ['-nostdin', '-i', options.filePath].concat(FFMPEG_OUT),
+                                ['-nostdin', '-i', options.filePath, ...FFMPEG_OUT],
                                 { stdio: ['ignore', 'pipe', 'ignore'] });
                             if (effectiveCacheDir && ensureCacheDir(effectiveCacheDir)) {
                                 // Write to a unique tmp file, rename to final on success.
@@ -230,7 +250,7 @@ module.exports = function (RED) {
                                 return;
                             }
                             const ffmpeg = spawn('ffmpeg',
-                                ['-nostdin', '-i', tempFile].concat(FFMPEG_OUT),
+                                ['-nostdin', '-i', tempFile, ...FFMPEG_OUT],
                                 { stdio: ['ignore', 'pipe', 'ignore'] });
                             setupFfmpeg(ffmpeg);
                             ffmpeg.on('close', () => { try { fs.unlinkSync(tempFile); } catch (_) {} });
@@ -239,12 +259,12 @@ module.exports = function (RED) {
                         else onTtsReady = spawnFfmpegFromFile;
 
                     } else {
-                        const ttsProc = spawn(tts.cmd, tts.args.concat([options.text]),
+                        const ttsProc = spawn(tts.cmd, [...tts.args, options.text],
                             { stdio: ['ignore', 'pipe', 'pipe'] });
                         currentTtsProc = ttsProc;
                         ttsProc.stderr.on('data', (d) => node.warn('TTS: ' + d.toString().trim()));
                         const ffmpeg = spawn('ffmpeg',
-                            ['-nostdin'].concat(tts.ffmpegInputFmt, ['-i', 'pipe:0'], FFMPEG_OUT),
+                            ['-nostdin', ...tts.ffmpegInputFmt, '-i', 'pipe:0', ...FFMPEG_OUT],
                             { stdio: ['pipe', 'pipe', 'ignore'] });
                         ttsProc.stdout.pipe(ffmpeg.stdin);
                         ttsProc.on('error', (err) => {
@@ -262,6 +282,8 @@ module.exports = function (RED) {
                 } else if (deviceStatus === 'error' || deviceStatus === 'failed') {
                     node.error('Device ' + deviceHost + ' reported: ' + deviceStatus);
                     node.status({ fill: 'red', shape: 'dot', text: deviceStatus });
+                    try { airtunes.stopAll(); } catch (_) {}
+                    try { airtunes.removeAllListeners(); } catch (_) {}
                     currentAirtunes = null;
                     if (onDone) onDone(new Error(deviceStatus));
                 }
@@ -274,11 +296,12 @@ module.exports = function (RED) {
                     setTimeout(() => {
                         if (currentAirtunes !== airtunes) return;
                         try { airtunes.stopAll(); } catch (_) {}
+                        try { airtunes.removeAllListeners(); } catch (_) {}
                         currentAirtunes = null;
                         currentFfmpeg   = null;
                         currentTtsProc  = null;
                         node.status({ fill: 'grey', shape: 'dot', text: 'done' });
-                        if (onDone) onDone(null, options.meta);
+                        if (onDone) onDone(null, isTts ? options.text : options.filePath);
                     }, 3000);
                 }
             });
@@ -287,7 +310,10 @@ module.exports = function (RED) {
                 clearTimeout(connectionTimer); connectionTimer = null;
                 node.error('AirTunes error: ' + (err.message || err));
                 node.status({ fill: 'red', shape: 'dot', text: 'error' });
-                if (currentAirtunes === airtunes) currentAirtunes = null;
+                if (currentAirtunes === airtunes) {
+                    try { airtunes.removeAllListeners(); } catch (_) {}
+                    currentAirtunes = null;
+                }
                 if (onDone) onDone(err);
             });
         }
@@ -307,21 +333,16 @@ module.exports = function (RED) {
             }
 
             const mode     = msg.mode   || node.mode;
-            const volume   = msg.volume !== undefined ? (msg.volume | 0) : (node.defaultVolume !== null ? node.defaultVolume : node.configNode.volume);
+            const volume   = msg.volume !== undefined ? (msg.volume | 0) : (node.defaultVolume !== null ? node.defaultVolume : devVolume);
             const voice    = msg.voice  || node.ttsVoice || '';
             const cacheDir = msg.cacheFolder !== undefined ? msg.cacheFolder : node.cacheDir;
 
-            stopPlayback();
+            stopPlayback(true);  // silent: status will be overwritten immediately by 'connecting…'
             const sid = ++sessionId;
 
-            function onDone(err, meta) {
+            function onDone(err, source) {
                 if (sessionId !== sid || err) return;
-                node.send({
-                    payload: 'ok',
-                    status:  'done',
-                    mode,
-                    source: mode === 'tts' ? (meta && meta.text) : (meta && meta.filePath)
-                });
+                node.send({ payload: 'ok', status: 'done', mode, source });
             }
 
             if (mode === 'tts') {
@@ -333,7 +354,7 @@ module.exports = function (RED) {
                     return;
                 }
                 node.status({ fill: 'yellow', shape: 'dot', text: 'connecting…' });
-                startPlayback({ type: 'tts', text, voice, volume, meta: { text } }, onDone);
+                startPlayback({ type: 'tts', text, voice, volume }, onDone);
 
             } else {
                 const filePath = msg.filePath || node.filePath;
@@ -343,13 +364,13 @@ module.exports = function (RED) {
                     return;
                 }
                 // Validate early — before opening the AirPlay connection
-                try { fs.accessSync(filePath, fs.constants.R_OK); } catch (_) {
+                try { fs.accessSync(filePath, R_OK); } catch (_) {
                     node.error('File not found or not readable: ' + filePath);
                     node.status({ fill: 'red', shape: 'dot', text: 'file not found' });
                     return;
                 }
                 node.status({ fill: 'yellow', shape: 'dot', text: 'connecting…' });
-                startPlayback({ type: 'file', filePath, volume, meta: { filePath }, cacheDir }, onDone);
+                startPlayback({ type: 'file', filePath, volume, cacheDir }, onDone);
             }
         });
 
