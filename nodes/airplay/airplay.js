@@ -25,7 +25,8 @@ module.exports = function (RED) {
     const ST_CONNECTING = { fill: 'yellow', shape: 'dot', text: 'connecting…' };
     const ST_PLAYING    = { fill: 'green',  shape: 'dot', text: 'playing' };
     const ST_CACHED     = { fill: 'blue',   shape: 'dot', text: 'playing (cached)' };
-    const ST_DONE       = { fill: 'grey',   shape: 'dot', text: 'done' };
+    const ST_DONE       = { fill: 'grey',   shape: 'dot',  text: 'done' };
+    const ST_STOPPED    = { fill: 'grey',   shape: 'ring', text: 'stopped' };
     const ST_TIMEOUT    = { fill: 'red',    shape: 'dot', text: 'timeout' };
     const ST_NO_CONFIG  = { fill: 'red',    shape: 'dot', text: 'no config' };
     const ST_NO_TEXT    = { fill: 'red',    shape: 'dot', text: 'no text' };
@@ -81,7 +82,7 @@ module.exports = function (RED) {
 
         function stopPlayback(silent) {
             if (connectionTimer) { clearTimeout(connectionTimer); connectionTimer = null; }
-            if (!currentAirtunes && !currentFfmpeg && !currentTtsProc) return;
+            if (!currentAirtunes && !currentFfmpeg && !currentTtsProc) return false;
             if (currentTtsProc) {
                 try { currentTtsProc.kill('SIGTERM'); } catch (_) {}
                 currentTtsProc = null;
@@ -96,6 +97,7 @@ module.exports = function (RED) {
                 currentAirtunes = null;
             }
             if (!silent) node.status(ST_CLEAR);
+            return true;
         }
 
         // ── TTS command builder ────────────────────────────────────────────
@@ -344,7 +346,11 @@ module.exports = function (RED) {
 
         node.on('input', function (msg) {
             if (msg.stop === true || msg.payload === 'stop') {
-                stopPlayback();
+                const wasStopped = stopPlayback();
+                if (wasStopped) {
+                    node.status(ST_STOPPED);
+                    node.send({ payload: 'stopped', status: 'stopped' });
+                }
                 return;
             }
 

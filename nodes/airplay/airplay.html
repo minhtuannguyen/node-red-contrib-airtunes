@@ -120,6 +120,12 @@
             In <b>TTS mode</b>: the text to speak.<br>
             Set to <code>"stop"</code> in either mode to stop playback immediately.
         </dd>
+        <dt class="optional">stop <span class="property-type">boolean</span></dt>
+        <dd>
+            Set to <code>true</code> to stop playback immediately.<br>
+            When playback was active, an output message <code>{ payload: "stopped", status: "stopped" }</code>
+            is sent and the node badge shows <b>stopped</b>. If nothing was playing, no message is sent.
+        </dd>
         <dt class="optional">filePath <span class="property-type">string</span></dt>
         <dd>Overrides the MP3 file path set on the node (file mode only).</dd>
         <dt class="optional">text <span class="property-type">string</span></dt>
@@ -136,21 +142,31 @@
         <dd><code>"file"</code> or <code>"tts"</code> — overrides the node's mode.</dd>
         <dt class="optional">cacheFolder <span class="property-type">string</span></dt>
         <dd>Overrides the MP3 Cache Dir for this playback (file mode only). Disables caching if empty.</dd>
-        <dt class="optional">stop <span class="property-type">boolean</span></dt>
-        <dd>Set to <code>true</code> to stop playback immediately.</dd>
     </dl>
 
-    <h3>Output (sent when playback finishes)</h3>
+    <h3>Output (sent when playback finishes or is stopped)</h3>
     <dl class="message-properties">
         <dt>payload <span class="property-type">string</span></dt>
-        <dd><code>"ok"</code></dd>
+        <dd><code>"ok"</code> when finished naturally, <code>"stopped"</code> when stopped via stop signal.</dd>
         <dt>status <span class="property-type">string</span></dt>
-        <dd><code>"done"</code></dd>
+        <dd><code>"done"</code> or <code>"stopped"</code></dd>
         <dt>mode <span class="property-type">string</span></dt>
-        <dd><code>"file"</code> or <code>"tts"</code></dd>
+        <dd><code>"file"</code> or <code>"tts"</code> — only present when finished naturally.</dd>
         <dt>source <span class="property-type">string</span></dt>
-        <dd>File path played (file mode) or text spoken (TTS mode).</dd>
+        <dd>File path played (file mode) or text spoken (TTS mode) — only present when finished naturally.</dd>
     </dl>
+
+    <h3>How to stop playback</h3>
+    <p>Send any of the following to the node's input while audio is playing:</p>
+    <ul>
+        <li><code>msg.stop = true</code></li>
+        <li><code>msg.payload = "stop"</code></li>
+    </ul>
+    <p>
+        The node will immediately kill all audio processes, close the AirPlay connection,
+        send <code>{ payload: "stopped", status: "stopped" }</code> on its output,
+        and show a <b>grey ring / stopped</b> status badge.
+    </p>
 
     <h3>TTS requirements</h3>
     <ul>
@@ -163,7 +179,9 @@
     <ul>
         <li><b>Yellow / connecting…</b> – waiting for the AirPlay device.</li>
         <li><b>Green / playing</b> – audio is streaming.</li>
-        <li><b>Grey / done</b> – playback finished normally.</li>
+        <li><b>Blue / playing (cached)</b> – streaming from PCM cache, no ffmpeg needed.</li>
+        <li><b>Grey dot / done</b> – playback finished normally.</li>
+        <li><b>Grey ring / stopped</b> – playback was stopped via stop signal.</li>
         <li><b>Red</b> – error — check the debug panel.</li>
     </ul>
 </script>
