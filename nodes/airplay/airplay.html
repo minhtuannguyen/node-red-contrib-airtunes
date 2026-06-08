@@ -144,17 +144,34 @@
         <dd>Overrides the MP3 Cache Dir for this playback (file mode only). Disables caching if empty.</dd>
     </dl>
 
-    <h3>Output (sent when playback finishes or is stopped)</h3>
+    <h3>Output (sent when playback finishes, is stopped, or is interrupted)</h3>
     <dl class="message-properties">
         <dt>payload <span class="property-type">string</span></dt>
-        <dd><code>"ok"</code> when finished naturally, <code>"stopped"</code> when stopped via stop signal.</dd>
+        <dd>
+            <code>"ok"</code> — finished naturally.<br>
+            <code>"stopped"</code> — stopped via explicit stop signal.<br>
+            <code>"interrupted"</code> — preempted because another airplay node started playing to the same device.
+        </dd>
         <dt>status <span class="property-type">string</span></dt>
-        <dd><code>"done"</code> or <code>"stopped"</code></dd>
+        <dd><code>"done"</code>, <code>"stopped"</code>, or <code>"interrupted"</code></dd>
         <dt>mode <span class="property-type">string</span></dt>
         <dd><code>"file"</code> or <code>"tts"</code> — only present when finished naturally.</dd>
         <dt>source <span class="property-type">string</span></dt>
         <dd>File path played (file mode) or text spoken (TTS mode) — only present when finished naturally.</dd>
     </dl>
+
+    <h3>Multi-node / single device coordination</h3>
+    <p>
+        If multiple airplay nodes target the <b>same physical device</b> (same host:port),
+        only one can stream at a time. When a node starts playing it automatically preempts
+        any other node that is currently active on that device. The preempted node:
+    </p>
+    <ul>
+        <li>has its audio stopped immediately,</li>
+        <li>receives <code>{ payload: "interrupted", status: "interrupted" }</code> on its output,</li>
+        <li>shows a <b>yellow ring / interrupted</b> badge.</li>
+    </ul>
+    <p>Use the <code>interrupted</code> output message to reset upstream state (e.g. turn a HomeKit switch back off).</p>
 
     <h3>How to stop playback</h3>
     <p>Send any of the following to the node's input while audio is playing:</p>
@@ -177,11 +194,12 @@
 
     <h3>Status indicators</h3>
     <ul>
-        <li><b>Yellow / connecting…</b> – waiting for the AirPlay device.</li>
-        <li><b>Green / playing</b> – audio is streaming.</li>
-        <li><b>Blue / playing (cached)</b> – streaming from PCM cache, no ffmpeg needed.</li>
+        <li><b>Yellow dot / connecting…</b> – waiting for the AirPlay device.</li>
+        <li><b>Green dot / playing</b> – audio is streaming.</li>
+        <li><b>Blue dot / playing (cached)</b> – streaming from PCM cache, no ffmpeg needed.</li>
         <li><b>Grey dot / done</b> – playback finished normally.</li>
         <li><b>Grey ring / stopped</b> – playback was stopped via stop signal.</li>
+        <li><b>Yellow ring / interrupted</b> – preempted by another node on the same device.</li>
         <li><b>Red</b> – error — check the debug panel.</li>
     </ul>
 </script>

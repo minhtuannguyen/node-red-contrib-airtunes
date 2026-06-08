@@ -22,21 +22,56 @@ module.exports = function (RED) {
     const ESPEAK_DEFAULT= { cmd: 'espeak', args: ['--stdout'], useTempFile: false, ffmpegInputFmt: ESPEAK_INPUT_FMT, hint: 'sudo apt install espeak' };
 
     // Pre-built node.status payloads — avoids object allocation on every status update
-    const ST_CONNECTING = { fill: 'yellow', shape: 'dot', text: 'connecting…' };
-    const ST_PLAYING    = { fill: 'green',  shape: 'dot', text: 'playing' };
-    const ST_CACHED     = { fill: 'blue',   shape: 'dot', text: 'playing (cached)' };
-    const ST_DONE       = { fill: 'grey',   shape: 'dot',  text: 'done' };
-    const ST_STOPPED    = { fill: 'grey',   shape: 'ring', text: 'stopped' };
-    const ST_TIMEOUT    = { fill: 'red',    shape: 'dot', text: 'timeout' };
-    const ST_NO_CONFIG  = { fill: 'red',    shape: 'dot', text: 'no config' };
-    const ST_NO_TEXT    = { fill: 'red',    shape: 'dot', text: 'no text' };
-    const ST_NO_FILE    = { fill: 'red',    shape: 'dot', text: 'no file path' };
-    const ST_NOT_FOUND  = { fill: 'red',    shape: 'dot', text: 'file not found' };
-    const ST_TTS_ERR    = { fill: 'red',    shape: 'dot', text: 'TTS error' };
-    const ST_FFMPEG_ERR = { fill: 'red',    shape: 'dot', text: 'ffmpeg error' };
-    const ST_CACHE_ERR  = { fill: 'red',    shape: 'dot', text: 'cache error' };
-    const ST_AIRT_ERR   = { fill: 'red',    shape: 'dot', text: 'error' };
-    const ST_CLEAR      = {};
+    const ST_CONNECTING  = { fill: 'yellow', shape: 'dot',  text: 'connecting…' };
+    const ST_PLAYING     = { fill: 'green',  shape: 'dot',  text: 'playing' };
+    const ST_CACHED      = { fill: 'blue',   shape: 'dot',  text: 'playing (cached)' };
+    const ST_DONE        = { fill: 'grey',   shape: 'dot',  text: 'done' };
+    const ST_STOPPED     = { fill: 'grey',   shape: 'ring', text: 'stopped' };
+    const ST_INTERRUPTED = { fill: 'yellow', shape: 'ring', text: 'interrupted' };
+    const ST_TIMEOUT     = { fill: 'red',    shape: 'dot',  text: 'timeout' };
+    const ST_NO_CONFIG   = { fill: 'red',    shape: 'dot',  text: 'no config' };
+    const ST_NO_TEXT     = { fill: 'red',    shape: 'dot',  text: 'no text' };
+    const ST_NO_FILE     = { fill: 'red',    shape: 'dot',  text: 'no file path' };
+    const ST_NOT_FOUND   = { fill: 'red',    shape: 'dot',  text: 'file not found' };
+    const ST_TTS_ERR     = { fill: 'red',    shape: 'dot',  text: 'TTS error' };
+    const ST_FFMPEG_ERR  = { fill: 'red',    shape: 'dot',  text: 'ffmpeg error' };
+    const ST_CACHE_ERR   = { fill: 'red',    shape: 'dot',  text: 'cache error' };
+    const ST_AIRT_ERR    = { fill: 'red',    shape: 'dot',  text: 'error' };
+    const ST_CLEAR       = {};
+
+    // ── Per-device play coordinator ──────────────────────────────────────────
+    // Maps 'host:port' → CoordinatorEntry of the currently active player.
+    // Shared across all AirPlayNode instances (module runs once per process).
+    // Guarantees only one node streams to a given physical device at a time.
+    // When a new node claims a device the current player is stopped immediately
+    // and receives { payload: 'interrupted', status: 'interrupted' } on its output.
+    //
+    // JavaScript is single-threaded — no mutex or lock is needed.
+    //
+    // CoordinatorEntry shape (one object per node instance, created once):
+    //   { nodeId: string, stopFn: Function, notifyFn: Function, closed: {val:bool} }
+    //
+    const deviceCoordinators = new Map();
+
+    function coordinatorClaim(deviceKey, newEntry) {
+        const prev = deviceCoordinators.get(deviceKey);
+        // Reference equality detects cross-node preemption.
+        // Same-node replay: newEntry === prev (same object), so no self-interrupt.
+        if (prev && prev !== newEntry && !prev.closed.val) {
+            prev.stopFn(true);   // stop silently — coordinator sets the status below
+            prev.notifyFn();     // send 'interrupted' on the preempted node's output
+        }
+        deviceCoordinators.set(deviceKey, newEntry);
+    }
+
+    function coordinatorRelease(deviceKey, nodeId) {
+        // Only delete if this node is still the registered owner.
+        // Prevents a stale onDone from a prior session evicting a newer owner.
+        const entry = deviceCoordinators.get(deviceKey);
+        if (entry && entry.nodeId === nodeId) deviceCoordinators.delete(deviceKey);
+    }
+
+    // ── Node constructor ────────────────────────────────────────────────────
 
     function AirPlayNode(config) {
         RED.nodes.createNode(this, config);
@@ -56,6 +91,15 @@ module.exports = function (RED) {
         const devHost   = node.configNode ? node.configNode.host   : '';
         const devPort   = node.configNode ? node.configNode.port   : 7000;
         const devVolume = node.configNode ? node.configNode.volume : 50;
+
+        // Coordinator key for the physical device this node targets.
+        // Two config nodes with the same host:port share the same queue slot,
+        // which is correct — they map to the same physical HomePod.
+        const deviceKey = devHost + ':' + devPort;
+
+        // Shared between coordEntry.notifyFn and node.on('close').
+        // Prevents node.status() / node.send() calls after the node is torn down.
+        const closedFlag = { val: false };
 
         let currentAirtunes  = null;
         let currentFfmpeg    = null;
@@ -99,6 +143,21 @@ module.exports = function (RED) {
             if (!silent) node.status(ST_CLEAR);
             return true;
         }
+
+        // Created once per node — reused for every coordinatorClaim() call.
+        // Using a single object reference means coordinatorClaim can detect
+        // self-preemption (same node replaying) via reference equality (prev !== newEntry)
+        // without any string comparison.
+        const coordEntry = {
+            nodeId:   node.id,
+            stopFn:   stopPlayback,      // closure — always refers to this node's own state
+            notifyFn: () => {
+                if (closedFlag.val) return;   // node already torn down — do nothing
+                node.status(ST_INTERRUPTED);
+                node.send({ payload: 'interrupted', status: 'interrupted' });
+            },
+            closed: closedFlag           // same ref — coordinatorClaim reads .val cheaply
+        };
 
         // ── TTS command builder ────────────────────────────────────────────
 
@@ -230,18 +289,31 @@ module.exports = function (RED) {
                     if (!isTts) {
                         const cachePath = getCacheInfo(options.filePath, effectiveCacheDir);
                         if (cachePath) {
-                            // Cache hit: skip ffmpeg, stream PCM directly
+                            // Cache hit: skip ffmpeg, stream PCM directly.
+                            // Use a manual pump (not .pipe) so the session guard is checked on
+                            // every chunk — this lets stopPlayback() interrupt within one chunk
+                            // instead of waiting for airtunes to drain its entire pre-buffered queue.
                             node.status(ST_CACHED);
-                            const rs = fs.createReadStream(cachePath, { highWaterMark: 256 * 1024 });
-                            rs.pipe(airtunes, PIPE_NO_END);
+                            const rs = fs.createReadStream(cachePath, { highWaterMark: 64 * 1024 });
                             currentFfmpeg = { kill: () => rs.destroy() };
+                            rs.on('data', (chunk) => {
+                                if (currentAirtunes !== airtunes) { rs.destroy(); return; }
+                                const ok = airtunes.write(chunk);
+                                if (!ok) {
+                                    rs.pause();
+                                    airtunes.once('drain', () => {
+                                        if (currentAirtunes === airtunes) rs.resume();
+                                        else rs.destroy();
+                                    });
+                                }
+                            });
+                            rs.on('end', () => {
+                                if (currentAirtunes === airtunes) airtunes.end();
+                            });
                             rs.on('error', (err) => {
                                 node.error('Cache read error: ' + err.message);
                                 node.status(ST_CACHE_ERR);
                                 if (onDone) onDone(err);
-                            });
-                            rs.on('close', () => {
-                                if (currentAirtunes === airtunes) airtunes.end();
                             });
                         } else {
                             // -nostdin: prevents ffmpeg polling stdin fd on Pi (saves CPU)
@@ -306,6 +378,14 @@ module.exports = function (RED) {
                 } else if (deviceStatus === 'error' || deviceStatus === 'failed') {
                     node.error('Device ' + deviceHost + ' reported: ' + deviceStatus);
                     node.status(ST_AIRT_ERR);
+                    if (currentFfmpeg) {
+                        try { currentFfmpeg.kill('SIGTERM'); } catch (_) {}
+                        currentFfmpeg = null;
+                    }
+                    if (currentTtsProc) {
+                        try { currentTtsProc.kill('SIGTERM'); } catch (_) {}
+                        currentTtsProc = null;
+                    }
                     try { airtunes.stopAll(); } catch (_) {}
                     try { airtunes.removeAllListeners(); } catch (_) {}
                     currentAirtunes = null;
@@ -334,7 +414,16 @@ module.exports = function (RED) {
                 clearTimeout(connectionTimer); connectionTimer = null;
                 node.error('AirTunes error: ' + (err.message || err));
                 node.status(ST_AIRT_ERR);
+                if (currentFfmpeg) {
+                    try { currentFfmpeg.kill('SIGTERM'); } catch (_) {}
+                    currentFfmpeg = null;
+                }
+                if (currentTtsProc) {
+                    try { currentTtsProc.kill('SIGTERM'); } catch (_) {}
+                    currentTtsProc = null;
+                }
                 if (currentAirtunes === airtunes) {
+                    try { currentAirtunes.stopAll(); } catch (_) {}
                     try { airtunes.removeAllListeners(); } catch (_) {}
                     currentAirtunes = null;
                 }
@@ -348,6 +437,7 @@ module.exports = function (RED) {
             if (msg.stop === true || msg.payload === 'stop') {
                 const wasStopped = stopPlayback();
                 if (wasStopped) {
+                    coordinatorRelease(deviceKey, node.id);
                     node.status(ST_STOPPED);
                     node.send({ payload: 'stopped', status: 'stopped' });
                 }
@@ -365,11 +455,13 @@ module.exports = function (RED) {
             const voice    = msg.voice  || node.ttsVoice || '';
             const cacheDir = msg.cacheFolder !== undefined ? msg.cacheFolder : node.cacheDir;
 
-            stopPlayback(true);  // silent: status will be overwritten immediately by 'connecting…'
+            stopPlayback(true);  // stop this node's own current session silently
             const sid = ++sessionId;
 
             function onDone(err, source) {
-                if (sessionId !== sid || err) return;
+                if (sessionId !== sid) return;              // stale session — a newer play was started
+                coordinatorRelease(deviceKey, node.id);    // free the device slot
+                if (err) return;                            // error already reported by the airtunes/device handler
                 node.send({ payload: 'ok', status: 'done', mode, source });
             }
 
@@ -382,6 +474,7 @@ module.exports = function (RED) {
                     return;
                 }
                 node.status(ST_CONNECTING);
+                coordinatorClaim(deviceKey, coordEntry);
                 startPlayback({ type: 'tts', text, voice, volume }, onDone);
 
             } else {
@@ -398,11 +491,14 @@ module.exports = function (RED) {
                     return;
                 }
                 node.status(ST_CONNECTING);
+                coordinatorClaim(deviceKey, coordEntry);
                 startPlayback({ type: 'file', filePath, volume, cacheDir }, onDone);
             }
         });
 
         node.on('close', function (done) {
+            closedFlag.val = true;                    // block any future notifyFn calls
+            coordinatorRelease(deviceKey, node.id);   // free the device slot before stopping audio
             stopPlayback();
             cachePathMap.clear();
             confirmedDirs.clear();
@@ -412,4 +508,3 @@ module.exports = function (RED) {
 
     RED.nodes.registerType('airplay', AirPlayNode);
 };
-
